@@ -13,8 +13,14 @@ import "strings"
 // builder produces from AgentProfile.CLIFlags):
 //   - "--key=value" → {key: "value"}
 //   - "--key" followed by a non-flag token   → {key: <token>}
-//   - "--key" followed by another --flag/EOF → {key: ""} (bare flag)
+//   - "--key" followed by another --flag/EOF → {key: nil} (bare flag)
 //   - tokens not starting with "--" are skipped (treated as orphaned values).
+//
+// Encoding note: bare flags are emitted as JSON null, not empty string. The
+// Claude Agent SDK contract is `Record<string, string | null>` where null
+// means presence-only (`--flag`) and "" would mean explicit empty value
+// (`--flag ""` — a separate empty argv). Conflating the two would inject an
+// extraneous empty argument that some CLI parsers misinterpret.
 //
 // Returns nil for empty input or when no flag is recognised so callers can
 // pass the result directly into NewSessionRequest.Meta.
@@ -42,7 +48,7 @@ func buildClaudeCodeMeta(tokens []string) map[string]any {
 			i++
 			continue
 		}
-		extraArgs[key] = "" // bare flag
+		extraArgs[key] = nil // bare flag → JSON null → SDK emits --key alone
 	}
 	if len(extraArgs) == 0 {
 		return nil
