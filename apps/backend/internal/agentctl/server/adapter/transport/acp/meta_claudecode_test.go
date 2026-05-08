@@ -1,7 +1,9 @@
 package acp
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/kandev/kandev/internal/agentctl/server/adapter/transport/shared"
@@ -27,9 +29,28 @@ func TestBuildClaudeCodeMeta_Empty(t *testing.T) {
 func TestBuildClaudeCodeMeta_BareFlag(t *testing.T) {
 	t.Parallel()
 	got := buildClaudeCodeMeta([]string{"--debug"})
-	want := claudeCodeMeta(map[string]any{"debug": ""})
+	want := claudeCodeMeta(map[string]any{"debug": nil})
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %#v, want %#v", got, want)
+	}
+}
+
+// Bare flags must marshal to JSON null, not "". The Claude Agent SDK
+// distinguishes the two: null → bare --flag, "" → --flag "" (extra empty
+// argv).
+func TestBuildClaudeCodeMeta_BareFlagMarshalsToNull(t *testing.T) {
+	t.Parallel()
+	got := buildClaudeCodeMeta([]string{"--debug"})
+	b, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	s := string(b)
+	if !strings.Contains(s, `"debug":null`) {
+		t.Errorf("expected debug to marshal as null, got %s", s)
+	}
+	if strings.Contains(s, `"debug":""`) {
+		t.Errorf("debug must not marshal as empty string, got %s", s)
 	}
 }
 
@@ -54,14 +75,14 @@ func TestBuildClaudeCodeMeta_EqualsForm(t *testing.T) {
 func TestBuildClaudeCodeMeta_MixedTokens(t *testing.T) {
 	t.Parallel()
 	got := buildClaudeCodeMeta([]string{
-		"--plugin-dir", "C:\\src\\TheOne\\plugin",
+		"--plugin-dir", "/some/path/to/plugin",
 		"--debug",
 		"--model=opus",
 		"--add-dir", "/another/path",
 	})
 	want := claudeCodeMeta(map[string]any{
-		"plugin-dir": "C:\\src\\TheOne\\plugin",
-		"debug":      "",
+		"plugin-dir": "/some/path/to/plugin",
+		"debug":      nil,
 		"model":      "opus",
 		"add-dir":    "/another/path",
 	})
@@ -75,7 +96,7 @@ func TestBuildClaudeCodeMeta_TwoBareFlagsInARow(t *testing.T) {
 	// `--foo --bar` — both bare; the second --bar starts with -- so the
 	// look-ahead for --foo must not consume it as a value.
 	got := buildClaudeCodeMeta([]string{"--foo", "--bar"})
-	want := claudeCodeMeta(map[string]any{"foo": "", "bar": ""})
+	want := claudeCodeMeta(map[string]any{"foo": nil, "bar": nil})
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("got %#v, want %#v", got, want)
 	}
