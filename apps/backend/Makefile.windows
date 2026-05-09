@@ -1,10 +1,14 @@
-# Cross-compile kandev binaries for windows/amd64 from a Linux/WSL host.
-# Requires the MinGW cross-compiler (apt: gcc-mingw-w64-x86-64).
+# Build kandev binaries natively on Windows (amd64).
+# Requires MSYS2 UCRT64 toolchain on PATH (gcc/make/bash/rsync) and
+# Go for Windows. GCC version must be ≤ 15.x — GCC 16+ emits COFF Big
+# Object files that Go cgo cannot parse.
 #
-# Usage (from apps/backend/):
+# Usage (from apps/backend/, in MSYS2 UCRT64 shell):
 #   make -f Makefile.windows build           # both binaries
 #   make -f Makefile.windows build-backend   # kandev only
 #   make -f Makefile.windows build-agentctl  # agentctl only
+#   make -f Makefile.windows build-pkg       # full bundle (binaries + web + CLI)
+#   make -f Makefile.windows clean           # remove Windows binaries + dist bundle
 
 BINARY_NAME := kandev
 BUILD_DIR := bin
@@ -12,18 +16,15 @@ GO := go
 GOFLAGS := -v
 LDFLAGS := -s -w
 
-CC_WIN := x86_64-w64-mingw32-gcc
-CXX_WIN := x86_64-w64-mingw32-g++
-
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_TIME := $(shell date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "unknown")
 
 LDFLAGS += -X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X main.BuildTime=$(BUILD_TIME)
 
-WIN_ENV := CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=$(CC_WIN) CXX=$(CXX_WIN)
+WIN_ENV := CGO_ENABLED=1
 
-.PHONY: build build-backend build-agentctl build-pkg
+.PHONY: build build-backend build-agentctl build-pkg clean
 
 ## Build both windows binaries
 build: build-backend build-agentctl
@@ -43,3 +44,10 @@ build-agentctl:
 	@echo "Building agentctl for windows/amd64..."
 	@mkdir -p $(BUILD_DIR)
 	$(WIN_ENV) $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/agentctl-windows-amd64.exe ./cmd/agentctl
+
+## Remove Windows binaries and the assembled dist bundle.
+## (Does not touch $(BUILD_DIR) wholesale — non-Windows builds may share it.)
+clean:
+	@echo "Cleaning Windows build artifacts..."
+	rm -f $(BUILD_DIR)/$(BINARY_NAME)-windows-amd64.exe $(BUILD_DIR)/agentctl-windows-amd64.exe
+	rm -rf ../../dist/kandev-windows-amd64
