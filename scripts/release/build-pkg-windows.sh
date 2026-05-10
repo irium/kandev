@@ -72,7 +72,7 @@ cp "$CLI_DIR/package.json" "$DIST_DIR/cli/package.json"
 # `kandev start` here: that's the in-repo dev path and would walk up to find
 # apps/backend/bin/ which is unrelated to the bundle.
 # CRLF for cmd; %% is a literal % in printf format string.
-printf '@echo off\r\nsetlocal\r\nset "ROOT=%%~dp0"\r\nset "KANDEV_BUNDLE_DIR=%%ROOT:~0,-1%%"\r\n\r\nset KANDEV_HEALTH_TIMEOUT_MS=120000\r\nnode "%%ROOT%%cli\\bin\\cli.js" --verbose %%*\r\n' \
+printf '@echo off\r\nsetlocal\r\nset "ROOT=%%~dp0"\r\nset "KANDEV_BUNDLE_DIR=%%ROOT:~0,-1%%"\r\n\r\nset KANDEV_HEALTH_TIMEOUT_MS=120000\r\nset KANDEV_NO_BROWSER=1\r\nnode "%%ROOT%%cli\\bin\\cli.js" --verbose %%*\r\n' \
   > "$DIST_DIR/start.cmd"
 
 cat > "$DIST_DIR/README.txt" <<EOF
