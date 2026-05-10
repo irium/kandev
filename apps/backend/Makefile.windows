@@ -9,6 +9,22 @@
 #   make -f Makefile.windows build-agentctl  # agentctl only
 #   make -f Makefile.windows build-pkg       # full bundle (binaries + web + CLI)
 #   make -f Makefile.windows clean           # remove Windows binaries + dist bundle
+#
+# Configuring allowed repository roots:
+#   The backend rejects repos whose path is outside repositoryDiscovery.roots
+#   ("Path is outside the allowed roots" in the workspace add-repo dialog).
+#   With no config the fallback is the user's home dir only.
+#
+#   Viper reads config.yaml from the backend's working directory (= the folder
+#   containing kandev.exe), so place the file next to the binary:
+#     - dev runs from this folder:               bin\config.yaml
+#     - packaged bundle (build-pkg) runs from:   <bundle>\bin\config.yaml
+#
+#   Example config.yaml:
+#     repositoryDiscovery:
+#       roots:
+#         - <absolute path to your repos folder>
+#       maxDepth: 5
 
 BINARY_NAME := kandev
 BUILD_DIR := bin
