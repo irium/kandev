@@ -198,7 +198,8 @@ const tabComponents: Record<string, React.FunctionComponent<IDockviewPanelHeader
 
 function SidebarContent({ panelId }: { panelId: string }) {
   const workspaceId = useAppStore((state) => state.workspaces.activeId);
-  const workflowId = useAppStore((state) => state.workflows.activeId);
+  // Read kanban.workflowId (task snapshot), not workflows.activeId (homepage filter), to preserve "All Workflows" across task navigation.
+  const workflowId = useAppStore((state) => state.kanban.workflowId);
   const workspaceName = useAppStore((state) => {
     const ws = state.workspaces.items.find((w: { id: string }) => w.id === workspaceId);
     return ws?.name ?? "Workspace";

@@ -33,6 +33,7 @@ async function selectWorkflowFilter(page: Page, optionLabel: string): Promise<vo
 
 test.describe("Kanban workflow filter", () => {
   let workflowBId: string | null = null;
+  let betaTaskId: string | null = null;
 
   // Pull `testPage` so its fixture (which runs `e2eReset` and resets user
   // settings) is set up before this hook seeds workflows/tasks — otherwise
@@ -48,10 +49,11 @@ test.describe("Kanban workflow filter", () => {
       workflow_id: seedData.workflowId,
       workflow_step_id: seedData.startStepId,
     });
-    await apiClient.createTask(seedData.workspaceId, BETA_TASK, {
+    const beta = await apiClient.createTask(seedData.workspaceId, BETA_TASK, {
       workflow_id: workflowB.id,
       workflow_step_id: startB.id,
     });
+    betaTaskId = beta.id;
   });
 
   test.afterEach(async ({ apiClient, seedData }) => {
@@ -59,6 +61,7 @@ test.describe("Kanban workflow filter", () => {
       await apiClient.deleteWorkflow(workflowBId).catch(() => {});
       workflowBId = null;
     }
+    betaTaskId = null;
     await apiClient.saveUserSettings({
       workspace_id: seedData.workspaceId,
       workflow_filter_id: seedData.workflowId,
@@ -110,6 +113,41 @@ test.describe("Kanban workflow filter", () => {
 
     const kanban = new KanbanPage(testPage);
     await kanban.goto();
+
+    await expect(kanban.taskCardByTitle(ALPHA_TASK)).toBeVisible({
+      timeout: TASK_VISIBLE_TIMEOUT,
+    });
+    await expect(kanban.taskCardByTitle(BETA_TASK)).toBeVisible({
+      timeout: TASK_VISIBLE_TIMEOUT,
+    });
+  });
+
+  // Regression: SSR wrote workflows.activeId from the task's workflow_id, clobbering the "All Workflows" filter on return. Pins the cross-page flow.
+  test("'All Workflows' selection survives navigating into a task and back", async ({
+    testPage,
+  }) => {
+    const kanban = new KanbanPage(testPage);
+    await kanban.goto();
+
+    await selectWorkflowFilter(testPage, "All Workflows");
+
+    await expect(kanban.taskCardByTitle(ALPHA_TASK)).toBeVisible({
+      timeout: TASK_VISIBLE_TIMEOUT,
+    });
+    await expect(kanban.taskCardByTitle(BETA_TASK)).toBeVisible({
+      timeout: TASK_VISIBLE_TIMEOUT,
+    });
+
+    // Visit a task that belongs to Workflow B — the SSR build path that used
+    // to poison the global filter.
+    if (!betaTaskId) throw new Error("beta task was not seeded");
+    await testPage.goto(`/t/${betaTaskId}`);
+    await expect(testPage).toHaveURL(new RegExp(`/t/${betaTaskId}`));
+
+    // Breadcrumb = client-side nav: goto("/") re-runs SSR and re-resolves activeId, masking the bug.
+    await testPage.getByTestId("task-breadcrumb-home").click();
+    await expect(testPage).toHaveURL(/\/$|\?/);
+    await expect(kanban.board).toBeVisible();
 
     await expect(kanban.taskCardByTitle(ALPHA_TASK)).toBeVisible({
       timeout: TASK_VISIBLE_TIMEOUT,

@@ -23,6 +23,7 @@ function applyWorkflowCreated(state: AppState, payload: WorkflowPayload): AppSta
   if (state.workspaces.activeId !== payload.workspace_id) return state;
   if (state.workflows.items.some((item) => item.id === payload.id)) return state;
   const isHidden = Boolean(payload.hidden);
+  // Never use `??` here: null is a valid "All Workflows" selection, not a missing value.
   return {
     ...state,
     workflows: {
@@ -35,9 +36,7 @@ function applyWorkflowCreated(state: AppState, payload: WorkflowPayload): AppSta
         },
         ...state.workflows.items,
       ],
-      // Hidden workflows must never be promoted to the active selection;
-      // they are system-only and would surface in the workflow picker.
-      activeId: state.workflows.activeId ?? (isHidden ? null : payload.id),
+      activeId: state.workflows.activeId,
     },
   };
 }
