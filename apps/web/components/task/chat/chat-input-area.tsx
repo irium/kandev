@@ -5,6 +5,7 @@ import { IconArrowRight, IconGitMerge, IconX } from "@tabler/icons-react";
 import { Button } from "@kandev/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@kandev/ui/tooltip";
 import { TodoIndicator } from "./todo-indicator";
+import { PRStatusChip } from "@/components/github/pr-status-chip";
 import { getWebSocketClient } from "@/lib/ws/connection";
 import { useKeyboardShortcut } from "@/hooks/use-keyboard-shortcut";
 import { useMessageHandler } from "@/hooks/use-message-handler";
@@ -290,6 +291,7 @@ function ChatStatusBar({
       className="flex items-center gap-1.5 py-1 text-xs text-muted-foreground"
     >
       {showTodos && <TodoIndicator todos={todoItems} />}
+      <PRStatusChip taskId={taskId} />
       {taskId && <PRMergedBanner key={taskId} taskId={taskId} />}
       {showProceed && (
         <Tooltip>

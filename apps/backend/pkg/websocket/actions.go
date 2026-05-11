@@ -84,6 +84,7 @@ const (
 	ActionSessionStop         = "session.stop"
 	ActionSessionDelete       = "session.delete"
 	ActionSessionSetPrimary   = "session.set_primary"
+	ActionSessionSetPlanMode  = "session.set_plan_mode"
 
 	// Agent actions
 	ActionAgentList   = "agent.list"
@@ -159,6 +160,9 @@ const (
 	ActionTaskPlanReverted         = "task.plan.reverted"
 	ActionAgentUpdated             = "agent.updated"
 	ActionAgentAvailableUpdated    = "agent.available.updated"
+	ActionAgentInstallStarted      = "agent.install.started"
+	ActionAgentInstallOutput       = "agent.install.output"
+	ActionAgentInstallFinished     = "agent.install.finished"
 	ActionWorkspaceCreated         = "workspace.created"
 	ActionWorkspaceUpdated         = "workspace.updated"
 	ActionWorkspaceDeleted         = "workspace.deleted"
