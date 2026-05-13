@@ -90,34 +90,58 @@ kubectl exec -it deployment/kandev -- npm install -g @anthropic-ai/claude-code
 
 After installing, log in with the agent's own auth (e.g. `claude login`), then click **Rescan** on the agents page.
 
+### Persistent agent and `gh` CLI auth
+
+The image sets `HOME=/data/home` for the `kandev` user, so every CLI that writes its auth state under `$HOME` lands on the PV and survives pod restarts and image upgrades. This includes:
+
+- `gh` CLI — `~/.config/gh/hosts.yml`
+- Claude Code — `~/.claude/.credentials.json`, `~/.claude.json`
+- Codex — `~/.codex/auth.json`, `~/.codex/config.toml`
+- Auggie — `~/.augment/session.json`
+- GitHub Copilot — `~/.copilot/...`
+- OpenCode, Amp — `~/.config/<tool>/...`
+
+So a one-time `kubectl exec -it deployment/kandev -- gh auth login` (or `claude login`, `codex login`, etc.) is enough; you do not need to redo it after `kubectl set image` or a `helm upgrade`.
+
+> The GitHub PAT configured in **Settings → Integrations → GitHub** is stored as a secret in the SQLite DB (or your external Postgres) and has always persisted. The `HOME=/data/home` setup covers the separate `gh auth login` flow that the backend falls back to when no `GITHUB_TOKEN` secret is set.
+
 ## Configuration
 
 Kandev reads configuration via `KANDEV_`-prefixed environment variables (Viper). Set these in `k8s/configmap.yaml` or as environment variables in the deployment.
 
 ### Core Settings
 
-| Env Var | Default | Description |
-|---------|---------|-------------|
-| `KANDEV_SERVER_PORT` | `38429` | Server port (API + WebSocket + Web UI) |
-| `KANDEV_HOME_DIR` | `/data` | Kandev home directory — contains `data/` (DB), `tasks/`, `worktrees/`, `repos/`, `sessions/`, and `lsp-servers/` |
-| `KANDEV_DATABASE_DRIVER` | `sqlite` | Database driver (`sqlite` or `postgres`) |
-| `KANDEV_DATABASE_PATH` | `$KANDEV_HOME_DIR/data/kandev.db` | SQLite database file path (override) |
-| `KANDEV_DOCKER_ENABLED` | `false` | Enable Docker runtime for agents (requires DinD) |
-| `KANDEV_LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error` |
-| `KANDEV_LOGGING_FORMAT` | auto | Log format: `json` (auto-detected in K8s) or `text` |
+See [`configuration.md`](./configuration.md) for the full reference (every backend knob and its YAML form). The tables below cover what's most commonly set in K8s manifests.
+
+| Env Var | Required | Default | Description |
+|---------|----------|---------|-------------|
+| `KANDEV_SERVER_PORT` | No | `38429` | Server port (API + WebSocket + Web UI) |
+| `KANDEV_HOME_DIR` | No | `/data` | Kandev home directory - contains `data/` (DB), `tasks/`, `worktrees/`, `repos/`, `sessions/`, and `lsp-servers/` |
+| `KANDEV_DATABASE_DRIVER` | No | `sqlite` | Database driver (`sqlite` or `postgres`) |
+| `KANDEV_DATABASE_PATH` | No | `$KANDEV_HOME_DIR/data/kandev.db` | SQLite database file path (override) |
+| `KANDEV_DOCKER_ENABLED` | No | `false` | Enable Docker runtime for agents (requires DinD) |
+| `KANDEV_LOG_LEVEL` | No | `info` | Log level: `debug`, `info`, `warn`, `error` |
+| `KANDEV_LOGGING_FORMAT` | No | auto | Log format: `json` (auto-detected in K8s) or `text` |
+| `KANDEV_LOGGING_OUTPUTPATH` | No | `stdout` | Log destination: `stdout`, `stderr`, or a file path (rotated when a file) |
+| `KANDEV_LOGGING_MAXSIZEMB` | No | `100` | Rotate the log file when it exceeds this size (MB). File output only. |
+| `KANDEV_LOGGING_MAXBACKUPS` | No | `5` | Max rotated files to retain (`0` = unlimited). File output only. |
+| `KANDEV_LOGGING_MAXAGEDAYS` | No | `30` | Max age of rotated files in days (`0` = unlimited). File output only. |
+| `KANDEV_LOGGING_COMPRESS` | No | `true` | Gzip rotated files. File output only. |
+
+> **Logging in K8s:** prefer the default `stdout` so kubelet collects logs. If you set `KANDEV_LOGGING_OUTPUTPATH` to a file, the active log is created with mode `0600` (owner read/write only); any sidecar reading it must run as the same user.
 
 > **Upgrading from a pre-`KANDEV_HOME_DIR` deployment?** The SQLite DB path moved from `/data/kandev.db` to `/data/data/kandev.db`, and `KANDEV_DATA_DIR` is gone — point `KANDEV_HOME_DIR` at the same volume mount (`/data`) instead. (`KANDEV_WORKTREE_BASEPATH` still works as an explicit override if you want to keep worktrees outside the home dir.) The backend auto-migrates the legacy `kandev.db` (plus any `-wal`/`-shm` files) on first boot — look for `Migrated SQLite database from pre-KANDEV_HOME_DIR location` in the pod logs. If you'd rather pin the old path, set `KANDEV_DATABASE_PATH=/data/kandev.db` in the ConfigMap.
 
 ### PostgreSQL Settings (when `KANDEV_DATABASE_DRIVER=postgres`)
 
-| Env Var | Default | Description |
-|---------|---------|-------------|
-| `KANDEV_DATABASE_HOST` | `localhost` | PostgreSQL host |
-| `KANDEV_DATABASE_PORT` | `5432` | PostgreSQL port |
-| `KANDEV_DATABASE_USER` | `kandev` | Database user |
-| `KANDEV_DATABASE_PASSWORD` | (empty) | Database password |
-| `KANDEV_DATABASE_DBNAME` | `kandev` | Database name |
-| `KANDEV_DATABASE_SSLMODE` | `disable` | SSL mode |
+| Env Var | Required | Default | Description |
+|---------|----------|---------|-------------|
+| `KANDEV_DATABASE_HOST` | No | `localhost` | PostgreSQL host |
+| `KANDEV_DATABASE_PORT` | No | `5432` | PostgreSQL port |
+| `KANDEV_DATABASE_USER` | Yes | `kandev` | Database user |
+| `KANDEV_DATABASE_PASSWORD` | Usually | (empty) | Database password - required unless your Postgres allows passwordless auth |
+| `KANDEV_DATABASE_DBNAME` | Yes | `kandev` | Database name |
+| `KANDEV_DATABASE_SSLMODE` | No | `disable` | SSL mode (`disable`, `require`, `verify-ca`, `verify-full`) |
 
 ## Database: SQLite vs PostgreSQL
 
@@ -153,6 +177,8 @@ The PVC at `/data` stores:
 
 - **SQLite database** (`/data/data/kandev.db`, `/data/data/kandev.db-wal`, `/data/data/kandev.db-shm`)
 - **Git worktrees** (`/data/worktrees/`), **tasks** (`/data/tasks/`), **repos** (`/data/repos/`), **sessions** (`/data/sessions/`), and **LSP servers** (`/data/lsp-servers/`)
+- **User home** (`/data/home/`) — `$HOME` for the in-pod `kandev` user; holds `gh` CLI auth and agent CLI auth state (see [Persistent agent and `gh` CLI auth](#persistent-agent-and-gh-cli-auth) above)
+- **npm globals** (`/data/.npm-global/`) — agent CLIs installed via `npm install -g`
 
 The PVC uses `ReadWriteOnce` access mode. If your cluster requires a specific StorageClass, add it to `k8s/pvc.yaml`:
 
@@ -201,6 +227,12 @@ kubectl edit deployment kandev
 ```
 
 SQLite migrations run automatically on startup — no manual migration step needed.
+
+> **Upgrading across the `HOME=/data/home` change:** if you used `kubectl exec` to `gh auth login` or log in to agent CLIs on a pre-`HOME=/data/home` image, that state lived in the ephemeral `/home/kandev` and is not carried over. Log in once on the new pod and it will persist for all subsequent upgrades. If you want to keep the old state, copy it onto the PV before upgrading:
+>
+> ```bash
+> kubectl exec deployment/kandev -- sh -c 'cp -a /home/kandev/. /data/home/ 2>/dev/null || true'
+> ```
 
 ## Troubleshooting
 

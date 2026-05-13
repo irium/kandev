@@ -2,6 +2,34 @@
 
 All notable changes to Kandev.
 
+## 0.45.0 - 2026-05-12
+
+### Features
+
+- support tasks without a repository ([#850](https://github.com/kdlbs/kandev/pull/850))
+
+### Bug Fixes
+
+- allow delete/archive of kanban cards in All Workflows view ([#886](https://github.com/kdlbs/kandev/pull/886))
+- preserve sidebar scroll position across task switches ([#884](https://github.com/kdlbs/kandev/pull/884))
+- lock workflow, block submit during bootstrap, hide None mode ([#885](https://github.com/kdlbs/kandev/pull/885))
+- persist container auth, restore tasks filter, refine PR status UI ([#883](https://github.com/kdlbs/kandev/pull/883))
+
+## 0.44.0 - 2026-05-11
+
+### Features
+
+- persist N-entry FIFO message queue ([#864](https://github.com/kdlbs/kandev/pull/864))
+- add size/age/backup rotation for file output ([#874](https://github.com/kdlbs/kandev/pull/874))
+
+### Bug Fixes
+
+- list remote branches for provider-backed workspace repos ([#876](https://github.com/kdlbs/kandev/pull/876))
+
+### Refactoring
+
+- close rotating sink on shutdown, add config docs ([#877](https://github.com/kdlbs/kandev/pull/877))
+
 ## 0.43.0 - 2026-05-11
 
 ### Bug Fixes

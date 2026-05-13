@@ -164,7 +164,7 @@ func realMain() int {
 	}
 	defer func() {
 		runCleanups()
-		_ = log.Sync()
+		_ = log.Close()
 	}()
 	logger.SetDefault(log)
 
@@ -326,12 +326,19 @@ func startAgentInfrastructure(
 	log.Info("Repository cloner configured",
 		zap.String("base_path", cfg.RepoClone.BasePath))
 
+	// Let the task service treat the cloner's base path as an implicit
+	// allow-listed root. Without this, deploys that put the clone base
+	// outside HOME (e.g. KANDEV_REPOCLONE_BASEPATH=/data/repos in a
+	// container) fail the discoveryRoots() allow-list check and local
+	// branch listing returns nothing.
+	services.Task.SetRepoCloneLocation(repoCloner)
+
 	// ============================================
 	// ORCHESTRATOR
 	// ============================================
 	log.Info("Initializing Orchestrator...")
 
-	orchestratorSvc, msgCreator, err := provideOrchestrator(cfg, log, eventBus, repos.Task, services.Task, services.User,
+	orchestratorSvc, msgCreator, err := provideOrchestrator(cfg, log, dbPool, eventBus, repos.Task, services.Task, services.User,
 		lifecycleMgr, agentRegistry, services.Workflow, repos.Secrets, repoCloner)
 	if err != nil {
 		log.Error("Failed to initialize orchestrator", zap.Error(err))
@@ -604,7 +611,7 @@ func awaitShutdown(
 	go func() {
 		second := <-quit
 		log.Warn("Received second shutdown signal, forcing exit", zap.String("signal", second.String()))
-		_ = log.Sync()
+		_ = log.Close()
 		os.Exit(1)
 	}()
 
