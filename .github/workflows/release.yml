@@ -360,6 +360,17 @@ jobs:
           go build -o bin/kandev${EXT} ./cmd/kandev
           go build -o bin/agentctl${EXT} ./cmd/agentctl
 
+      # Cross-compile a linux/amd64 agentctl regardless of the host platform.
+      # Remote executors (local Docker, remote Docker, Sprites) bind-mount this
+      # binary into the container — without it, Docker sessions fail with
+      # "agentctl linux binary not found" on Mac/Windows installs and even on
+      # Linux installs (the resolver looks for the -linux-amd64 suffix).
+      # CGO is off so this works from any host without extra toolchain setup.
+      - name: Build linux/amd64 agentctl helper
+        run: |
+          cd apps/backend
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 CC= go build -o bin/agentctl-linux-amd64 ./cmd/agentctl
+
       - name: Package bundle
         run: |
           rm -rf dist/kandev/bin dist/kandev/web
@@ -367,6 +378,7 @@ jobs:
           EXT=${{ matrix.goos == 'windows' && '.exe' || '' }}
           cp apps/backend/bin/kandev${EXT} dist/kandev/bin/
           cp apps/backend/bin/agentctl${EXT} dist/kandev/bin/
+          cp apps/backend/bin/agentctl-linux-amd64 dist/kandev/bin/
           mkdir -p dist/kandev/web
           cp -R dist/web/. dist/kandev/web/
           # cli/ was already placed by the build-cli job (downloaded above).
@@ -430,9 +442,112 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  docker-universal:
+    name: Build & push universal container image
+    needs: [prepare, docker]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write    # push to GHCR
+    # Build flow: push to a per-run staging tag, gate on size against the
+    # staging tag, then `buildx imagetools create` to promote the same
+    # manifest to the user-facing tags. The promote step is metadata-only -
+    # no rebuild, no new bytes - so this costs us one extra registry call
+    # in exchange for never publishing an oversized image as :universal.
+    #
+    # Tradeoff: staging tags accumulate in GHCR over time (one per release
+    # run). Auto-cleanup isn't safe here - `imagetools create` produces a
+    # byte-identical manifest list when retagging a single source, so the
+    # staging tag and the promoted user-facing tags share the same package
+    # version in GHCR. Deleting the version to drop the staging tag would
+    # also drop :universal / :vX.Y.Z-universal. A separate cleanup workflow
+    # filtering for versions whose ONLY tags match `universal-staging-*`
+    # would be the correct way to address this if it becomes a problem.
+    env:
+      STAGING_IMAGE: ghcr.io/kdlbs/kandev:universal-staging-${{ needs.prepare.outputs.tag }}-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build universal on top of the vanilla image we just pushed. Passing
+      # the exact `:vX.Y.Z` tag (not `:latest`) keeps the pair coherent:
+      # universal-of-vX.Y.Z always rests on vanilla-vX.Y.Z, even if a later
+      # release moves `:latest`. The tag pushed here is the staging tag;
+      # final tags are applied below only if the size gate passes.
+      - name: Build and push (staging tag)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.universal
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            BASE_IMAGE=ghcr.io/kdlbs/kandev:${{ needs.prepare.outputs.tag }}
+          tags: ${{ env.STAGING_IMAGE }}
+          cache-from: type=gha,scope=universal
+          cache-to: type=gha,mode=max,scope=universal
+
+      # Universal size gate. Inspects the staging tag - the image is in
+      # GHCR but under a per-run tag no user pulls. Failing the gate aborts
+      # before promotion, so the user-facing :universal / :vX.Y.Z-universal
+      # tags never move to an oversized image. Bump MAX_COMPRESSED_BYTES
+      # deliberately when adding scope, with a one-sentence justification
+      # in the commit msg.
+      - name: Enforce size budget
+        env:
+          MAX_COMPRESSED_BYTES: "2684354560"   # 2.5 GiB
+        run: |
+          set -euo pipefail
+          # Inspect the multi-arch manifest and sum compressed layer sizes
+          # for linux/amd64. amd64 is the bigger of the two arches in
+          # practice, so gating on it gives us a single-number signal.
+          docker buildx imagetools inspect "$STAGING_IMAGE" --raw \
+              > /tmp/index.json
+          AMD64_DIGEST="$(jq -r '
+              .manifests[]
+              | select(.platform.architecture == "amd64" and .platform.os == "linux")
+              | .digest
+            ' /tmp/index.json)"
+          docker buildx imagetools inspect "ghcr.io/kdlbs/kandev@${AMD64_DIGEST}" --raw \
+              > /tmp/manifest.json
+          TOTAL="$(jq '[.layers[].size] | add' /tmp/manifest.json)"
+          echo "Universal image (amd64) compressed size: $TOTAL bytes (max: $MAX_COMPRESSED_BYTES)"
+          if [ "$TOTAL" -gt "$MAX_COMPRESSED_BYTES" ]; then
+            echo "::error::Universal image exceeds compressed-size budget. Staging tag $STAGING_IMAGE will not be promoted. See docs/images.md inclusion policy." >&2
+            exit 1
+          fi
+
+      # Promote: `buildx imagetools create` retargets an existing manifest
+      # list to new tag(s) without rebuilding or re-uploading layers. Multi-
+      # arch is preserved. Only runs if the size gate passed (default step
+      # ordering); if any earlier step failed, the user-facing tags stay at
+      # whatever they pointed to before this run.
+      - name: Promote staging to final tags
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag "ghcr.io/kdlbs/kandev:${{ needs.prepare.outputs.version }}-universal" \
+            --tag "ghcr.io/kdlbs/kandev:${{ needs.prepare.outputs.tag }}-universal" \
+            --tag "ghcr.io/kdlbs/kandev:universal" \
+            "$STAGING_IMAGE"
+
   publish-release:
     name: Publish GitHub release
-    needs: [prepare, build-bundles]
+    # docker-universal is included so its size gate (and any build failure)
+    # blocks the release. Without this, publish-release runs in parallel with
+    # docker-universal and an oversized universal image still ships a release.
+    needs: [prepare, build-bundles, docker-universal]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     permissions:

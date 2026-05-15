@@ -22,7 +22,7 @@ func (r *SpritesExecutor) setupPortForwarding(
 	}
 
 	r.logger.Debug("setting up port forwarding",
-		zap.Int("local_port", localPort),
+		zap.Int(MetadataKeyLocalPort, localPort),
 		zap.Int("remote_port", remotePort))
 
 	proxyCtx, cancel := context.WithCancel(context.Background())
@@ -67,7 +67,7 @@ func (r *SpritesExecutor) applyNetworkPolicy(
 	defer cancel()
 
 	r.logger.Info("applying network policy from profile",
-		zap.String("sprite_name", spriteName),
+		zap.String(MetadataKeySpriteName, spriteName),
 		zap.Int("rule_count", len(rules)))
 
 	return client.UpdateNetworkPolicy(policyCtx, spriteName, &sprites.NetworkPolicy{Rules: rules})

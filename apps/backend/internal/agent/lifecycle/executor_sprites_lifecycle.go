@@ -18,7 +18,7 @@ func (r *SpritesExecutor) reconnectSprite(ctx context.Context, client *sprites.C
 	defer cancel()
 	sprite, err := client.GetSprite(stepCtx, name)
 	if err != nil {
-		return nil, fmt.Errorf("failed to reconnect sprite %q: %w", name, err)
+		return nil, fmt.Errorf("failed to reconnect sprite %q: %w", name, spritesutil.WrapNotFound(err))
 	}
 	return sprite, nil
 }
@@ -27,17 +27,33 @@ func (r *SpritesExecutor) StopInstance(ctx context.Context, instance *ExecutorIn
 	if instance == nil {
 		return nil
 	}
-	spriteName := getMetadataString(instance.Metadata, "sprite_name")
+	spriteName := getMetadataString(instance.Metadata, MetadataKeySpriteName)
 	if spriteName == "" {
 		return nil
 	}
 
+	// Always tear down the local proxy session — it's tied to the agentctl
+	// instance we just stopped and would point at a stale TCP connection
+	// after the agent process exits.
 	r.mu.Lock()
 	if proxy, ok := r.proxies[instance.InstanceID]; ok {
 		r.closeProxySession(proxy)
 		delete(r.proxies, instance.InstanceID)
 	}
 	r.mu.Unlock()
+
+	// Plain "stop the agent" runs (e.g. user clicks Stop, then later wants to
+	// resume) must NOT destroy the cloud sandbox: the user's working tree,
+	// installed deps, and any in-progress files live there. Only destroy the
+	// sandbox for explicit terminal lifecycle events (task/session deleted or
+	// archived). Resume then re-attaches the same sandbox in seconds.
+	if !shouldRunExecutorCleanup(instance.StopReason) {
+		r.logger.Info("preserving sprite sandbox after agent stop",
+			zap.String(MetadataKeySpriteName, spriteName),
+			zap.String("instance_id", instance.InstanceID),
+			zap.String("stop_reason", instance.StopReason))
+		return nil
+	}
 
 	r.mu.RLock()
 	token := r.tokens[instance.InstanceID]
@@ -55,7 +71,7 @@ func (r *SpritesExecutor) StopInstance(ctx context.Context, instance *ExecutorIn
 	r.runTerminalCleanupScript(ctx, sprite, instance)
 	if err := sprite.Destroy(); err != nil {
 		r.logger.Warn("failed to destroy sprite",
-			zap.String("sprite_name", spriteName),
+			zap.String(MetadataKeySpriteName, spriteName),
 			zap.Error(err))
 		return fmt.Errorf("failed to destroy sprite: %w", err)
 	}
@@ -64,7 +80,8 @@ func (r *SpritesExecutor) StopInstance(ctx context.Context, instance *ExecutorIn
 	delete(r.tokens, instance.InstanceID)
 	r.mu.Unlock()
 
-	r.logger.Info("sprite destroyed", zap.String("sprite_name", spriteName))
+	r.logger.Info("sprite destroyed", zap.String(MetadataKeySpriteName, spriteName),
+		zap.String("stop_reason", instance.StopReason))
 	return nil
 }
 
@@ -88,7 +105,7 @@ func (r *SpritesExecutor) runTerminalCleanupScript(ctx context.Context, sprite *
 			instance.Metadata,
 			nil,
 			getGitRemoteURL,
-			r.injectTokenIntoURL,
+			injectGitHubTokenIntoCloneURL,
 		))
 	resolved := resolver.Resolve(script)
 	if strings.TrimSpace(resolved) == "" {
@@ -112,9 +129,20 @@ func (r *SpritesExecutor) runTerminalCleanupScript(ctx context.Context, sprite *
 		zap.String("reason", instance.StopReason))
 }
 
+// Terminal stop reasons that trigger destructive executor cleanup
+// (sandbox teardown, container removal, per-instance session-dir removal).
+// Anything outside this set is treated as a "preserve" stop — see
+// shouldRunExecutorCleanup.
+const (
+	StopReasonTaskArchived    = "task archived"
+	StopReasonTaskDeleted     = "task deleted"
+	StopReasonSessionArchived = "session archived"
+	StopReasonSessionDeleted  = "session deleted"
+)
+
 func shouldRunExecutorCleanup(reason string) bool {
 	switch strings.ToLower(strings.TrimSpace(reason)) {
-	case "task archived", "task deleted", "session archived", "session deleted":
+	case StopReasonTaskArchived, StopReasonTaskDeleted, StopReasonSessionArchived, StopReasonSessionDeleted:
 		return true
 	default:
 		return false
@@ -125,7 +153,7 @@ func (r *SpritesExecutor) GetRemoteStatus(ctx context.Context, instance *Executo
 	if instance == nil {
 		return nil, fmt.Errorf("instance is nil")
 	}
-	spriteName := strings.TrimSpace(getMetadataString(instance.Metadata, "sprite_name"))
+	spriteName := strings.TrimSpace(getMetadataString(instance.Metadata, MetadataKeySpriteName))
 	if spriteName == "" {
 		return &RemoteStatus{
 			RuntimeName:   string(r.Name()),
