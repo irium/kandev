@@ -130,10 +130,18 @@ func (m *Manager) GetPassthroughBuffer(ctx context.Context, sessionID string) (s
 	return buffer.String(), nil
 }
 
-// buildPassthroughEnv builds the environment map for a passthrough session,
-// including Kandev metadata and required credentials from the agent runtime config.
+// buildPassthroughEnv builds the environment map for a passthrough session.
+// Order of merge mirrors buildEnvForExecution: AgentProfile.EnvVars first
+// (workspace-level user-configurable vars like CLAUDE_CONFIG_DIR), then
+// kandev internal markers and agent-required credentials override on top.
+// Without the AgentProfile merge the passthrough subprocess inherits an empty
+// env and SDK config dirs / API keys configured on the workspace profile
+// silently fall back to user-home defaults.
 func (m *Manager) buildPassthroughEnv(ctx context.Context, execution *AgentExecution, requiredEnv []string) map[string]string {
-	env := make(map[string]string)
+	env := m.resolveAgentProfileEnv(ctx, execution.AgentProfileID)
+	if env == nil {
+		env = make(map[string]string)
+	}
 	env["KANDEV_TASK_ID"] = execution.TaskID
 	env["KANDEV_SESSION_ID"] = execution.SessionID
 	env["KANDEV_AGENT_PROFILE_ID"] = execution.AgentProfileID

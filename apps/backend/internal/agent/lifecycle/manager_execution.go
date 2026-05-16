@@ -405,6 +405,16 @@ func (m *Manager) createExecution(ctx context.Context, taskID string, info *Work
 		AuthToken:           m.revealRuntimeSecret(ctx, info.Metadata, MetadataKeyAuthTokenSecret),
 		BootstrapNonce:      m.revealRuntimeSecret(ctx, info.Metadata, MetadataKeyBootstrapNonceSecret),
 		CLIFlagTokens:       m.resolveCLIFlagTokens(ctx, info.AgentProfileID),
+		// Forward AgentProfile.EnvVars to the runtime instance. The Launch /
+		// ResumeSession orchestrator paths merge these into req.Env before
+		// calling LaunchAgent; the lazy workspace-only path (any
+		// GetOrEnsureExecution* caller after backend restart) lands here
+		// directly, so without this merge the runtime instance gets spawned
+		// with empty env and CLAUDE_CONFIG_DIR (and any other workspace
+		// profile var) is lost. The agent subprocess inherits the instance
+		// env via agentctl, and ACP session/load then looks under the wrong
+		// SDK root → -32002 Resource not found.
+		Env: m.resolveAgentProfileEnv(ctx, info.AgentProfileID),
 	}
 
 	runtimeInstance, err := rt.CreateInstance(ctx, req)
