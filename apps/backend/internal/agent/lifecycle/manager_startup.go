@@ -204,6 +204,48 @@ func (m *Manager) buildEnvForExecution(executionID string, req *LaunchRequest, a
 	return env
 }
 
+// resolveAgentProfileEnv loads the agent profile by id and resolves its
+// EnvVars (inline values and secret references) into a flat map. Returns nil
+// when the profile cannot be loaded, has no env vars, or all entries fail to
+// resolve. Mirrors orchestrator/executor.resolveAgentEnvVars so launch paths
+// that bypass the orchestrator's merge step (createExecution for workspace-only
+// recovery, buildPassthroughEnv for passthrough sessions) still forward the
+// workspace's AgentProfile.EnvVars (e.g. CLAUDE_CONFIG_DIR) to the agent
+// subprocess.
+func (m *Manager) resolveAgentProfileEnv(ctx context.Context, profileID string) map[string]string {
+	if profileID == "" || m.profileResolver == nil {
+		return nil
+	}
+	profileInfo, err := m.profileResolver.ResolveProfile(ctx, profileID)
+	if err != nil || profileInfo == nil || len(profileInfo.EnvVars) == 0 {
+		return nil
+	}
+	resolved := make(map[string]string, len(profileInfo.EnvVars))
+	for _, ev := range profileInfo.EnvVars {
+		if ev.SecretID != "" {
+			if m.secretStore == nil {
+				continue
+			}
+			value, err := m.secretStore.Reveal(ctx, ev.SecretID)
+			if err != nil {
+				m.logger.Warn("failed to resolve secret for agent profile env var",
+					zap.String("profile_id", profileID),
+					zap.String("key", ev.Key),
+					zap.String("secret_id", ev.SecretID),
+					zap.Error(err))
+				continue
+			}
+			resolved[ev.Key] = value
+		} else if ev.Value != "" {
+			resolved[ev.Key] = ev.Value
+		}
+	}
+	if len(resolved) == 0 {
+		return nil
+	}
+	return resolved
+}
+
 // waitForAgentctlReady waits for the agentctl HTTP server to be ready.
 // This enables shell/workspace features without starting the agent process.
 func (m *Manager) waitForAgentctlReady(execution *AgentExecution) {
