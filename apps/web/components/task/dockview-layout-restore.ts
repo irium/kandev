@@ -1,9 +1,11 @@
 import type { DockviewReadyEvent, SerializedDockview } from "dockview-react";
+import type { StoreApi } from "zustand";
 import { useDockviewStore } from "@/lib/state/dockview-store";
 import { applyLayoutFixups } from "@/lib/state/dockview-layout-builders";
 import { isLayoutShapeHealthy } from "@/lib/state/dockview-layout-health";
 import { measureDockviewContainer } from "@/lib/state/dockview-measure";
 import type { LayoutState } from "@/lib/state/layout-manager";
+import type { AppState } from "@/lib/state/store";
 import { getEnvLayout, getEnvMaximizeState, removeEnvMaximizeState } from "@/lib/local-storage";
 
 const LAYOUT_STORAGE_KEY = "dockview-layout-v1";
@@ -12,7 +14,9 @@ const LAYOUT_STORAGE_KEY = "dockview-layout-v1";
 export function sanitizeLayout(
   layout: any,
   validComponents: Set<string>,
-  options: { stripSessionPanels?: boolean } = {},
+  options:
+    | { stripSessionPanels: true; excludeSessionIds?: never }
+    | { stripSessionPanels?: false | undefined; excludeSessionIds?: Set<string> } = {},
 ): any {
   if (!isLayoutShapeHealthy(layout)) return null;
 
@@ -29,6 +33,18 @@ export function sanitizeLayout(
     if (id.startsWith("session:")) {
       if (options.stripSessionPanels) {
         invalidIds.add(id);
+      } else if (options.excludeSessionIds) {
+        // Per-env restore: drop session panels that we know belong to a
+        // different env (a phantom from a previously-deleted task). Sessions
+        // we have no mapping for are kept — they may be a still-loading WS
+        // arrival, and useAutoSessionTab's reconcile will clean them up if
+        // they turn out to be stale.
+        const sid = id.slice("session:".length);
+        if (options.excludeSessionIds.has(sid)) {
+          invalidIds.add(id);
+        } else {
+          validPanels[id] = panel;
+        }
       } else {
         validPanels[id] = panel;
       }
@@ -111,21 +127,37 @@ function tryRestoreMaximizeOnly(api: DockviewReadyEvent["api"], envId: string): 
   }
 }
 
+/**
+ * Restore the per-env saved layout, after sanitizing phantom session panels.
+ * Returns true on a successful fromJSON, false when no usable saved layout
+ * exists (caller falls through to maximize-only / global / default build).
+ */
+function tryRestoreEnvLayout(
+  api: DockviewReadyEvent["api"],
+  envId: string,
+  validComponents: Set<string>,
+  phantomSessionIds: Set<string> | undefined,
+): boolean {
+  const envLayout = getEnvLayout(envId);
+  if (!envLayout) return false;
+  const sanitized = sanitizeLayout(envLayout, validComponents, {
+    excludeSessionIds: phantomSessionIds,
+  });
+  if (!sanitized) return false;
+  api.fromJSON(sanitized as SerializedDockview);
+  applyFixupsWithMaximize(api, envId);
+  return true;
+}
+
 export function tryRestoreLayout(
   api: DockviewReadyEvent["api"],
   currentEnvId: string | null,
   validComponents: Set<string>,
+  phantomSessionIds?: Set<string>,
 ): boolean {
   if (currentEnvId) {
     try {
-      const envLayout = getEnvLayout(currentEnvId);
-      if (envLayout) {
-        const sanitized = sanitizeLayout(envLayout, validComponents);
-        if (!sanitized) return false;
-        api.fromJSON(sanitized as SerializedDockview);
-        applyFixupsWithMaximize(api, currentEnvId);
-        return true;
-      }
+      if (tryRestoreEnvLayout(api, currentEnvId, validComponents, phantomSessionIds)) return true;
     } catch {
       // fall through to maximize-only / global fallback
     }
@@ -150,4 +182,40 @@ export function tryRestoreLayout(
   }
 
   return false;
+}
+
+/**
+ * Collect session ids that DEFINITIVELY belong to a different env than `envId`.
+ * These are phantoms (typically from a previously-deleted task) that must be
+ * stripped on env-layout restore.
+ *
+ * Sessions absent from `environmentIdBySessionId` are NOT classified as
+ * phantoms — they may be a still-loading WS arrival that legitimately belongs
+ * to this env. `useAutoSessionTab`'s reconcile cleans up anything that turns
+ * out to be stale once the store catches up.
+ */
+export function collectPhantomSessionIdsForEnv(
+  state: { environmentIdBySessionId: Record<string, string> },
+  envId: string,
+): Set<string> {
+  const result = new Set<string>();
+  for (const [sessionId, mappedEnv] of Object.entries(state.environmentIdBySessionId)) {
+    if (mappedEnv && mappedEnv !== envId) result.add(sessionId);
+  }
+  return result;
+}
+
+/**
+ * Restore the env's saved layout, stripping session panels that we KNOW
+ * belong to a different env — guards against phantom panels from
+ * previously-deleted tasks resurfacing on restore.
+ */
+export function restoreEnvLayout(
+  api: DockviewReadyEvent["api"],
+  envId: string | null,
+  appStore: StoreApi<AppState>,
+  validComponents: Set<string>,
+): boolean {
+  const phantoms = envId ? collectPhantomSessionIdsForEnv(appStore.getState(), envId) : undefined;
+  return tryRestoreLayout(api, envId, validComponents, phantoms);
 }

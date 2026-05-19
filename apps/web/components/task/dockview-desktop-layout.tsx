@@ -10,7 +10,7 @@ import {
 } from "dockview-react";
 import { themeKandev } from "@/lib/layout/dockview-theme";
 import { useDockviewStore, performLayoutSwitch } from "@/lib/state/dockview-store";
-import { tryRestoreLayout } from "./dockview-layout-restore";
+import { restoreEnvLayout } from "./dockview-layout-restore";
 import {
   setupContainerResizeSync,
   setupGroupTracking,
@@ -513,8 +513,8 @@ export const DockviewDesktopLayout = memo(function DockviewDesktopLayout({
       setApi(api);
 
       const currentEnvId = envIdRef.current;
-      // If a layout intent was passed via URL, skip saved layout restoration
-      const restored = !initialLayout && tryRestoreLayout(api, currentEnvId, VALID_COMPONENTS);
+      const restored =
+        !initialLayout && restoreEnvLayout(api, currentEnvId, appStore, VALID_COMPONENTS);
       if (!restored) {
         buildDefaultLayout(api, initialLayout ?? (compact ? "compact" : undefined));
       }
