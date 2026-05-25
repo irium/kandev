@@ -8,6 +8,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/kandev/kandev/internal/agent/agents"
 	"github.com/kandev/kandev/internal/events"
 	"github.com/kandev/kandev/internal/events/bus"
 	"github.com/kandev/kandev/internal/orchestrator/executor"
@@ -1057,16 +1058,38 @@ func (s *Service) drainQueuedMessageAfterTransition(ctx context.Context, session
 }
 
 // deliverPassthroughPrompt writes a prompt to PTY stdin and marks the session as running.
-// Appends \r (carriage return) to simulate pressing Enter — TUI agents in raw terminal mode
-// expect CR, not LF, as the submit key. Returns an error only if writing fails.
+// Uses the per-agent PlanPassthroughStdinChunks so Claude's inter-chunk SubmitDelay is
+// honored here too (queued / workflow-auto-start path); other agents stay on the single
+// atomic write. Falls back to the simple "\r" append if config resolution fails so a
+// transient lookup error never silently swallows the prompt.
 func (s *Service) deliverPassthroughPrompt(ctx context.Context, sessionID, content string) error {
-	if err := s.agentManager.WritePassthroughStdin(ctx, sessionID, content+"\r"); err != nil {
-		return fmt.Errorf("write to passthrough stdin: %w", err)
+	pt, cfgErr := s.agentManager.ResolvePassthroughConfig(ctx, sessionID)
+	if cfgErr != nil {
+		s.logger.Warn("failed to resolve passthrough config, falling back to \\r submit",
+			zap.String("session_id", sessionID),
+			zap.Error(cfgErr))
 	}
+	// Mark RUNNING before any writes so concurrent PromptTask / queued-message
+	// delivery is blocked by checkSessionPromptable during the inter-chunk
+	// SubmitDelay window (150ms for Claude). Mark error is non-fatal.
 	if err := s.agentManager.MarkPassthroughRunning(sessionID); err != nil {
-		s.logger.Warn("failed to mark passthrough as running",
+		s.logger.Warn("failed to mark passthrough as running before prompt",
 			zap.String("session_id", sessionID),
 			zap.Error(err))
+	}
+	if cfgErr != nil {
+		if err := s.agentManager.WritePassthroughStdin(ctx, sessionID, content+"\r"); err != nil {
+			return fmt.Errorf("write to passthrough stdin: %w", err)
+		}
+		return nil
+	}
+	for _, chunk := range agents.PlanPassthroughStdinChunks(content, pt) {
+		if chunk.DelayBefore > 0 {
+			time.Sleep(chunk.DelayBefore)
+		}
+		if err := s.agentManager.WritePassthroughStdin(ctx, sessionID, chunk.Data); err != nil {
+			return fmt.Errorf("write to passthrough stdin: %w", err)
+		}
 	}
 	return nil
 }
@@ -1167,8 +1190,10 @@ func (s *Service) autoStartStepPrompt(
 	// (HasKandevContext guard) so the pre-wrap doesn't double.
 	// The HasKandevContext check on `prompt` also guards against any future
 	// caller that ever pre-wraps before reaching here (none today).
+	// Passthrough sessions skip the wrap: the prompt is typed straight into
+	// the agent CLI's TTY and the user sees it verbatim.
 	recordedPrompt := prompt
-	if session.State == models.TaskSessionStateCreated && (prompt != "" || len(attachments) > 0) && !sysprompt.HasKandevContext(prompt) {
+	if session.State == models.TaskSessionStateCreated && !session.IsPassthrough && (prompt != "" || len(attachments) > 0) && !sysprompt.HasKandevContext(prompt) {
 		recordedPrompt = sysprompt.InjectKandevContext(taskID, sessionID, prompt)
 	}
 	s.recordAutoStartMessage(ctx, taskID, sessionID, recordedPrompt, planMode, origin)

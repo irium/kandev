@@ -1,0 +1,529 @@
+"use client";
+
+import { useCallback, useMemo, useState } from "react";
+import {
+  IconArrowRight,
+  IconMessageCircle,
+  IconMessageDots,
+  IconSend,
+  IconTrash,
+  IconX,
+} from "@tabler/icons-react";
+import { Button } from "@kandev/ui/button";
+import { Textarea } from "@kandev/ui/textarea";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@kandev/ui/tooltip";
+import { useToast } from "@/components/toast-provider";
+import { PRStatusChip } from "@/components/github/pr-status-chip";
+import { PassthroughComposer } from "./passthrough-composer";
+import { PRMergedBanner } from "./chat/chat-input-area";
+import { useAppStore } from "@/components/state-provider";
+import { useNextWorkflowStep } from "@/hooks/domains/kanban/use-plan-actions";
+import { usePendingDiffCommentsByFile } from "@/hooks/domains/comments/use-diff-comments";
+import { useCommentsStore } from "@/lib/state/slices/comments/comments-store";
+import { useFileEditors } from "@/hooks/use-file-editors";
+import { useResponsiveBreakpoint } from "@/hooks/use-responsive-breakpoint";
+import { formatReviewCommentsAsMarkdown } from "@/lib/state/slices/comments/format";
+import type { DiffComment } from "@/lib/diff/types";
+import { getWebSocketClient } from "@/lib/ws/connection";
+import { PassthroughTerminal } from "./passthrough-terminal";
+
+/**
+ * PassthroughToolbar wraps the PTY terminal with the kandev surface that the
+ * full ACP `ChatStatusBar` + `ChatInputArea` provide for chat mode: PR status,
+ * merge banner, "Move to next step" workflow advancement, a collapsible Chat
+ * compose box, and a collapsible Comments panel showing pending review comments
+ * (each editable inline with a clickable file reference).
+ *
+ * Default focus stays on the xterm terminal — both Chat and Comments are
+ * collapsed behind toolbar buttons so the user can keep raw-terminal
+ * interaction front-and-centre and only opt in when they want to compose a
+ * follow-up or review what's about to be attached. Ctrl-C in the xterm
+ * cancels the agent, so no dedicated Stop button is needed.
+ */
+export function PassthroughToolbar({
+  sessionId,
+  taskId,
+}: {
+  sessionId: string | null | undefined;
+  taskId: string | null;
+}) {
+  const [composerOpen, setComposerOpen] = useState(false);
+  const [commentsOpenState, setCommentsOpen] = useState(false);
+
+  const sessionState = useAppStore((state) =>
+    sessionId ? (state.taskSessions.items[sessionId]?.state ?? null) : null,
+  );
+  const isAgentBusy = sessionState === "RUNNING" || sessionState === "STARTING";
+
+  const nextStep = useNextWorkflowStep(taskId);
+  const showProceed = !!nextStep.proceedStepName && !isAgentBusy;
+
+  const { pendingComments, pendingCount } = usePendingPassthroughComments(sessionId);
+  const { isMobile } = useResponsiveBreakpoint();
+  const { openFile } = useFileEditors();
+
+  // Derive open state: auto-close when pending comments are cleared
+  const commentsOpen = commentsOpenState && pendingCount > 0;
+
+  const handleSendMessage = useSendPassthroughMessage({
+    taskId,
+    sessionId,
+    pendingComments,
+    onSent: () => {
+      setComposerOpen(false);
+      setCommentsOpen(false);
+    },
+  });
+
+  return (
+    <div className="flex h-full flex-col bg-card" data-testid="passthrough-toolbar">
+      <div className="flex-1 min-h-0">
+        <PassthroughTerminal sessionId={sessionId} mode="agent" enableTouchScroll={isMobile} />
+      </div>
+
+      {commentsOpen && pendingCount > 0 && (
+        <CommentsPanel
+          comments={pendingComments}
+          openFile={openFile}
+          onSend={() => handleSendMessage("")}
+        />
+      )}
+
+      {composerOpen && (
+        <PassthroughComposer
+          onSubmit={handleSendMessage}
+          onCancel={() => setComposerOpen(false)}
+          autoFocus
+          placeholder="Type a message, Shift+Enter for newline, Esc to close"
+          header={pendingCount > 0 ? <PendingCommentsHint count={pendingCount} /> : null}
+        />
+      )}
+
+      <PassthroughStatusRow
+        taskId={taskId}
+        nextStepName={nextStep.proceedStepName}
+        onProceed={nextStep.proceed}
+        isMoving={nextStep.isMoving}
+        showProceed={showProceed}
+        composerOpen={composerOpen}
+        onToggleComposer={() => setComposerOpen((open) => !open)}
+        commentsOpen={commentsOpen}
+        onToggleComments={() => setCommentsOpen((open) => !open)}
+        pendingCommentsCount={pendingCount}
+      />
+    </div>
+  );
+}
+
+function flattenComments(byFile: Record<string, DiffComment[]>): DiffComment[] {
+  const all: DiffComment[] = [];
+  for (const list of Object.values(byFile)) all.push(...list);
+  return all;
+}
+
+function usePendingPassthroughComments(sessionId: string | null | undefined) {
+  const pendingCommentsByFile = usePendingDiffCommentsByFile(sessionId ?? null);
+  const pendingComments = useMemo(
+    () => flattenComments(pendingCommentsByFile),
+    [pendingCommentsByFile],
+  );
+  return { pendingComments, pendingCount: pendingComments.length };
+}
+
+function useSendPassthroughMessage({
+  taskId,
+  sessionId,
+  pendingComments,
+  onSent,
+}: {
+  taskId: string | null;
+  sessionId: string | null | undefined;
+  pendingComments: DiffComment[];
+  onSent: () => void;
+}) {
+  const { toast } = useToast();
+  const markCommentsSent = useCommentsStore((s) => s.markCommentsSent);
+
+  return useCallback(
+    async (content: string) => {
+      if (!taskId || !sessionId) {
+        toast({ title: "Session not ready", variant: "error" });
+        throw new Error("Session not ready");
+      }
+      const client = getWebSocketClient();
+      if (!client) {
+        toast({ title: "Not connected — please reload to retry", variant: "error" });
+        throw new Error("WebSocket client not available");
+      }
+      // Format pending review comments as markdown and prepend so they reach
+      // the agent's stdin alongside the user's typed prompt. Mark them sent
+      // only after the WS request resolves so a failed send doesn't drop the
+      // user's queued comments.
+      const formatted =
+        pendingComments.length > 0
+          ? formatReviewCommentsAsMarkdown(pendingComments) + content
+          : content;
+      try {
+        await client.request(
+          "message.add",
+          { task_id: taskId, session_id: sessionId, content: formatted },
+          10_000,
+        );
+        if (pendingComments.length > 0) {
+          markCommentsSent(pendingComments.map((c) => c.id));
+        }
+        onSent();
+      } catch (error) {
+        console.error("Failed to send passthrough message:", error);
+        toast({ title: "Failed to send message", variant: "error" });
+        throw error;
+      }
+    },
+    [taskId, sessionId, toast, pendingComments, markCommentsSent, onSent],
+  );
+}
+
+function ChatToggleButton({
+  composerOpen,
+  onToggle,
+}: {
+  composerOpen: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          variant={composerOpen ? "default" : "outline"}
+          size="sm"
+          className="h-6 gap-1 px-2.5 text-xs cursor-pointer"
+          onClick={onToggle}
+          data-testid="passthrough-toggle-composer"
+          aria-pressed={composerOpen}
+        >
+          {composerOpen ? (
+            <IconX className="h-3.5 w-3.5" />
+          ) : (
+            <IconMessageCircle className="h-3.5 w-3.5" />
+          )}
+          Chat
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-xs">
+        {composerOpen ? (
+          <p>
+            Close the compose box (or press <kbd>Esc</kbd> inside it). The CLI agent terminal keeps
+            focus.
+          </p>
+        ) : (
+          <div className="space-y-1">
+            <p>
+              Open a kandev-controlled compose box above the terminal to type a follow-up message.
+              Press <kbd>Enter</kbd> to send, <kbd>Shift+Enter</kbd> for a newline.
+            </p>
+            <p className="text-muted-foreground">
+              The text is delivered straight to the CLI agent&apos;s stdin — pending review comments
+              (if any) are prepended automatically.
+            </p>
+          </div>
+        )}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+function commentsToggleClassName(count: number, commentsOpen: boolean): string {
+  // Vivid amber when there are pending comments so the user sees "something
+  // to do" — washes back to plain outline once they're cleared / sent.
+  if (count === 0) return "h-6 gap-1 px-2.5 text-xs cursor-pointer";
+  if (commentsOpen) return "h-6 gap-1 px-2.5 text-xs cursor-pointer";
+  return "h-6 gap-1 px-2.5 text-xs cursor-pointer border-amber-500/60 bg-amber-500/15 text-amber-700 hover:bg-amber-500/25 hover:text-amber-700 dark:text-amber-300 dark:hover:text-amber-200";
+}
+
+function CommentsToggleButton({
+  commentsOpen,
+  onToggle,
+  pendingCommentsCount,
+}: {
+  commentsOpen: boolean;
+  onToggle: () => void;
+  pendingCommentsCount: number;
+}) {
+  const disabled = pendingCommentsCount === 0;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          variant={commentsOpen ? "default" : "outline"}
+          size="sm"
+          className={commentsToggleClassName(pendingCommentsCount, commentsOpen)}
+          onClick={onToggle}
+          disabled={disabled}
+          data-testid="passthrough-toggle-comments"
+          aria-pressed={commentsOpen}
+        >
+          {commentsOpen ? (
+            <IconX className="h-3.5 w-3.5" />
+          ) : (
+            <IconMessageDots className="h-3.5 w-3.5" />
+          )}
+          Comments
+          {pendingCommentsCount > 0 && (
+            <span
+              data-testid="passthrough-pending-count"
+              className="ml-1 rounded-full bg-amber-500/40 px-1.5 py-0 text-[10px] font-semibold text-amber-900 dark:text-amber-100"
+            >
+              {pendingCommentsCount}
+            </span>
+          )}
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-xs">
+        <CommentsTooltipBody commentsOpen={commentsOpen} count={pendingCommentsCount} />
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+function CommentsTooltipBody({ commentsOpen, count }: { commentsOpen: boolean; count: number }) {
+  if (count === 0) {
+    return (
+      <div className="space-y-1">
+        <p>No pending review comments.</p>
+        <p className="text-muted-foreground">
+          Add a comment from the diff or file view, then come back here to review and send it.
+        </p>
+      </div>
+    );
+  }
+  if (commentsOpen) {
+    return (
+      <p>
+        Hide the comment list. The comments stay queued and will still be sent next time you submit
+        (here or from the chat box).
+      </p>
+    );
+  }
+  const plural = count === 1 ? "" : "s";
+  return (
+    <div className="space-y-1">
+      <p>
+        {count} pending review comment{plural}. Click to expand the list — you can edit each
+        comment, click the file path to jump to the source, or remove a comment with the trash icon.
+      </p>
+      <p className="text-muted-foreground">
+        Hit <strong>Send to agent</strong> inside the panel to deliver them to the CLI agent right
+        away, or just open the chat box and type a follow-up — the comments will be prepended.
+      </p>
+    </div>
+  );
+}
+
+function PendingCommentsHint({ count }: { count: number }) {
+  return (
+    <div
+      data-testid="passthrough-pending-comments-banner"
+      className="flex items-center gap-1.5 border-b bg-amber-500/10 px-2 py-1 text-xs text-amber-700 dark:text-amber-300"
+    >
+      <IconMessageDots className="h-3.5 w-3.5" />
+      <span>
+        {count} pending review comment{count === 1 ? "" : "s"} will be attached to this message.
+      </span>
+    </div>
+  );
+}
+
+function CommentsPanel({
+  comments,
+  openFile,
+  onSend,
+}: {
+  comments: DiffComment[];
+  openFile: (path: string) => void;
+  onSend: () => Promise<void> | void;
+}) {
+  const [isSending, setIsSending] = useState(false);
+  const handleSend = useCallback(async () => {
+    if (isSending) return;
+    setIsSending(true);
+    try {
+      await onSend();
+    } catch {
+      // onSend already toasted the error; keep panel open so the user can retry.
+    } finally {
+      setIsSending(false);
+    }
+  }, [isSending, onSend]);
+
+  const count = comments.length;
+  const plural = count === 1 ? "" : "s";
+  return (
+    <div
+      data-testid="passthrough-comments-panel"
+      className="flex max-h-72 flex-col border-t bg-amber-500/5"
+    >
+      <div className="flex items-center justify-between gap-2 border-b border-amber-500/20 bg-amber-500/10 px-2 py-1 text-xs">
+        <span className="font-medium text-amber-700 dark:text-amber-300">
+          {count} review comment{plural} ready to send
+        </span>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              size="sm"
+              variant="default"
+              onClick={handleSend}
+              disabled={isSending}
+              className="h-6 gap-1 px-2.5 text-xs cursor-pointer"
+              data-testid="passthrough-send-comments"
+            >
+              <IconSend className="h-3.5 w-3.5" />
+              Send to agent
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent className="max-w-xs">
+            <p>
+              Deliver these comments to the CLI agent&apos;s stdin as a single message — no need to
+              open the chat box. The agent receives the same markdown that prepending to a typed
+              message would produce.
+            </p>
+          </TooltipContent>
+        </Tooltip>
+      </div>
+      <div className="flex-1 space-y-2 overflow-y-auto px-2 py-2">
+        {comments.map((comment) => (
+          <CommentCard key={comment.id} comment={comment} openFile={openFile} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function formatLineRange(comment: DiffComment): string {
+  return comment.startLine === comment.endLine
+    ? `${comment.startLine}`
+    : `${comment.startLine}-${comment.endLine}`;
+}
+
+function CommentCard({
+  comment,
+  openFile,
+}: {
+  comment: DiffComment;
+  openFile: (path: string) => void;
+}) {
+  const updateComment = useCommentsStore((s) => s.updateComment);
+  const removeComment = useCommentsStore((s) => s.removeComment);
+  const lineRange = formatLineRange(comment);
+
+  const handleOpenFile = useCallback(() => {
+    openFile(comment.filePath);
+  }, [openFile, comment.filePath]);
+
+  return (
+    <div
+      data-testid="passthrough-comment-card"
+      className="rounded-md border border-amber-500/30 bg-card px-2 py-1.5 text-xs"
+    >
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <button
+          type="button"
+          onClick={handleOpenFile}
+          className="truncate text-left font-mono text-[11px] text-primary hover:underline cursor-pointer"
+          data-testid="passthrough-comment-file-ref"
+          title={`${comment.filePath}:${lineRange}`}
+        >
+          {comment.filePath}:{lineRange}
+        </button>
+        <button
+          type="button"
+          onClick={() => removeComment(comment.id)}
+          className="rounded p-0.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive cursor-pointer"
+          aria-label="Remove comment"
+          data-testid="passthrough-comment-remove"
+        >
+          <IconTrash className="h-3.5 w-3.5" />
+        </button>
+      </div>
+      {comment.codeContent && (
+        <pre className="mb-1 max-h-16 overflow-y-auto rounded bg-muted/50 px-1.5 py-1 text-[10px] font-mono leading-tight">
+          {comment.codeContent}
+        </pre>
+      )}
+      <Textarea
+        value={comment.text}
+        onChange={(e) => updateComment(comment.id, { text: e.target.value })}
+        className="min-h-[2rem] resize-none text-xs"
+        rows={Math.min(4, Math.max(1, comment.text.split("\n").length))}
+        placeholder="Write a comment…"
+        data-testid="passthrough-comment-textarea"
+      />
+    </div>
+  );
+}
+
+type StatusRowProps = {
+  taskId: string | null;
+  nextStepName: string | null;
+  onProceed: () => void;
+  isMoving: boolean;
+  showProceed: boolean;
+  composerOpen: boolean;
+  onToggleComposer: () => void;
+  commentsOpen: boolean;
+  onToggleComments: () => void;
+  pendingCommentsCount: number;
+};
+
+function PassthroughStatusRow({
+  taskId,
+  nextStepName,
+  onProceed,
+  isMoving,
+  showProceed,
+  composerOpen,
+  onToggleComposer,
+  commentsOpen,
+  onToggleComments,
+  pendingCommentsCount,
+}: StatusRowProps) {
+  return (
+    <div
+      data-testid="passthrough-status-row"
+      className="flex flex-shrink-0 items-center gap-1.5 border-t bg-card px-2 py-1 text-xs text-muted-foreground"
+    >
+      <ChatToggleButton composerOpen={composerOpen} onToggle={onToggleComposer} />
+      <CommentsToggleButton
+        commentsOpen={commentsOpen}
+        onToggle={onToggleComments}
+        pendingCommentsCount={pendingCommentsCount}
+      />
+
+      <div className="ml-auto flex items-center gap-1.5">
+        <PRStatusChip taskId={taskId} />
+        {taskId && <PRMergedBanner key={taskId} taskId={taskId} />}
+        {showProceed && nextStepName && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-6 gap-1 px-2.5 text-xs cursor-pointer text-primary"
+                onClick={onProceed}
+                disabled={isMoving}
+                data-testid="passthrough-proceed-next-step"
+              >
+                {nextStepName}
+                <IconArrowRight className="h-3.5 w-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Move task to the next workflow step</TooltipContent>
+          </Tooltip>
+        )}
+      </div>
+    </div>
+  );
+}

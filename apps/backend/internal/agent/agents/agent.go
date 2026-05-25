@@ -252,6 +252,25 @@ type PassthroughConfig struct {
 	ResumeFlag        Param // generic "continue last session" (e.g. NewParam("-c"), NewParam("--resume", "latest"))
 	SessionResumeFlag Param // resume a specific session by ID (e.g. NewParam("--resume"))
 	WaitForTerminal   bool
+	// AutoInjectPrompt enables writing the task description to the PTY stdin
+	// after the first idle window. Default false preserves today's behavior.
+	AutoInjectPrompt bool
+	// SubmitSequence is appended after the prompt text when auto-injecting
+	// and when routing chat-compose messages to the PTY. "\r" for most TUIs.
+	// Empty inherits DefaultPassthroughSubmitSequence at PTY write sites.
+	SubmitSequence string
+	// DisableBracketedPaste sends prompt bytes verbatim (plus SubmitSequence).
+	// Claude Code enables bracketed-paste *mode* (?2004h) in its Ink TUI; injecting
+	// ESC[200~…ESC[201~ delimiters breaks input (nothing appears in the prompt).
+	DisableBracketedPaste bool
+	// SubmitDelay is the wait inserted before each non-first chunk when writing the
+	// prompt+submit sequence to PTY stdin. Ink-based TUIs (Claude Code) detect a
+	// "paste burst" when many stdin bytes arrive in one read and absorb the
+	// trailing \r into the pasted content instead of dispatching it as Enter.
+	// Splitting the prompt body from the submit byte with a small delay forces the
+	// submit to arrive as a discrete keystroke. 0 disables (other TUIs handle one
+	// atomic write fine).
+	SubmitDelay time.Duration
 }
 
 // DefaultBufferMaxBytes is the default maximum buffer size for passthrough mode (2 MB).

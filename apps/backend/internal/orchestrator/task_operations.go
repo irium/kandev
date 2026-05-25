@@ -356,7 +356,10 @@ func (s *Service) StartCreatedSession(ctx context.Context, taskID, sessionID, ag
 	// Message.ToAPI strips for display). Idempotent — upstream call sites that
 	// record the user message themselves (wsAddMessage on CREATED sessions)
 	// wrap first, and the HasKandevContext guard prevents a second wrap here.
-	if (effectivePrompt != "" || len(attachments) > 0) && !sysprompt.HasKandevContext(effectivePrompt) {
+	// Passthrough profiles skip the wrap: the prompt is typed straight into the
+	// agent CLI's TTY and the user sees it verbatim — they don't want a wall of
+	// MCP-tool boilerplate prepended to "hello".
+	if (effectivePrompt != "" || len(attachments) > 0) && !sysprompt.HasKandevContext(effectivePrompt) && !session.IsPassthrough {
 		effectivePrompt = sysprompt.InjectKandevContext(taskID, sessionID, effectivePrompt)
 	}
 
@@ -568,7 +571,15 @@ func (s *Service) startTask(ctx context.Context, taskID string, agentProfileID s
 	// recordAutoStartMessage) wrap before recording the user message so the DB
 	// row carries the block; the HasKandevContext guard makes this orchestrator
 	// pass a no-op in those cases instead of double-wrapping.
-	if (effectivePrompt != "" || len(attachments) > 0) && !sysprompt.HasKandevContext(effectivePrompt) {
+	// Passthrough sessions skip the wrap: the prompt is typed straight into the
+	// agent CLI's TTY and the user sees it verbatim — they don't want a wall of
+	// MCP-tool boilerplate prepended to "hello". Use the session snapshot, not a
+	// live profile lookup, so a mid-run profile edit cannot change wrap behavior.
+	skipKandevMCPWrap := false
+	if launchSession, sessErr := s.repo.GetTaskSession(ctx, sessionID); sessErr == nil {
+		skipKandevMCPWrap = launchSession.IsPassthrough
+	}
+	if (effectivePrompt != "" || len(attachments) > 0) && !sysprompt.HasKandevContext(effectivePrompt) && !skipKandevMCPWrap {
 		effectivePrompt = sysprompt.InjectKandevContext(task.ID, sessionID, effectivePrompt)
 	}
 
@@ -1861,6 +1872,17 @@ func (s *Service) PromptTask(ctx context.Context, taskID, sessionID string, prom
 		return nil, err
 	}
 
+	// Inject config context for config-mode sessions (dedicated settings chat, not plan mode)
+	effectivePrompt := prompt
+	if cm, ok := session.Metadata["config_mode"].(bool); ok && cm {
+		effectivePrompt = sysprompt.InjectConfigContext(sessionID, prompt)
+	}
+
+	// Inject plan mode prefix for follow-up messages in plan mode sessions.
+	if planMode {
+		effectivePrompt = sysprompt.InjectPlanMode(effectivePrompt)
+	}
+
 	// Ensure the agent process is actually running. After a lazy backend restart,
 	// the session may be in WAITING_FOR_INPUT but no agent process exists yet.
 	if err := s.ensureSessionRunning(ctx, sessionID, session); err != nil {
@@ -1876,17 +1898,14 @@ func (s *Service) PromptTask(ctx context.Context, taskID, sessionID string, prom
 	// freshly-persisted AgentExecutionID.
 	if reloaded, err := s.repo.GetTaskSession(ctx, sessionID); err == nil && reloaded != nil {
 		session = reloaded
-	}
-
-	// Inject config context for config-mode sessions (dedicated settings chat, not plan mode)
-	effectivePrompt := prompt
-	if cm, ok := session.Metadata["config_mode"].(bool); ok && cm {
-		effectivePrompt = sysprompt.InjectConfigContext(sessionID, prompt)
-	}
-
-	// Inject plan mode prefix for follow-up messages in plan mode sessions.
-	if planMode {
-		effectivePrompt = sysprompt.InjectPlanMode(effectivePrompt)
+		// Re-apply transforms in case metadata changed during ensureSessionRunning.
+		effectivePrompt = prompt
+		if cm, ok := session.Metadata["config_mode"].(bool); ok && cm {
+			effectivePrompt = sysprompt.InjectConfigContext(sessionID, prompt)
+		}
+		if planMode {
+			effectivePrompt = sysprompt.InjectPlanMode(effectivePrompt)
+		}
 	}
 
 	// Check if model switching is requested
@@ -2107,6 +2126,9 @@ func (s *Service) CancelAgent(ctx context.Context, sessionID string) error {
 	// just to host the cancel message.
 	cancelTurnID := s.getActiveTurnID(sessionID)
 
+	// The agent manager routes the cancel to the right signal: ACP cancel for
+	// regular sessions, Ctrl-C via PTY stdin for passthrough sessions. Service
+	// stays protocol-agnostic; the seam is in lifecycle.Manager.CancelAgentBySessionID.
 	if err := s.agentManager.CancelAgent(ctx, sessionID); err != nil {
 		switch {
 		case errors.Is(err, lifecycle.ErrNoExecutionForSession):

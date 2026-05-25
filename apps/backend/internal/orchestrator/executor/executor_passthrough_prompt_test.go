@@ -5,7 +5,9 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/kandev/kandev/internal/agent/agents"
 	"github.com/kandev/kandev/internal/task/models"
 	v1 "github.com/kandev/kandev/pkg/api/v1"
 )
@@ -51,7 +53,9 @@ func TestExecutor_Prompt_PassthroughWritesStdin(t *testing.T) {
 	if call.SessionID != "sess-1" {
 		t.Errorf("WritePassthroughStdin session = %q, want sess-1", call.SessionID)
 	}
-	wantData := "hello agent" + passthroughSubmitSequence
+	// Mock's ResolvePassthroughConfig returns SubmitSequence "\r" by default
+	// when isPassthroughSessionFunc reports the session is passthrough.
+	wantData := "hello agent\r"
 	if call.Data != wantData {
 		t.Errorf("WritePassthroughStdin data = %q, want %q", call.Data, wantData)
 	}
@@ -91,10 +95,14 @@ func TestExecutor_Prompt_PassthroughWriteErrorReturnsError(t *testing.T) {
 	if result != nil {
 		t.Errorf("expected nil result on error, got %+v", result)
 	}
-	// MarkPassthroughRunning must not be called when the write fails — otherwise
-	// the UI would flash "running" for a prompt the agent never received.
-	if got := len(agentManager.markPassthroughRunningCalls); got != 0 {
-		t.Errorf("MarkPassthroughRunning must not be called when stdin write fails; got %d call(s)", got)
+	// MarkPassthroughRunning is now called BEFORE the chunk loop so concurrent
+	// PromptTask calls are blocked during the inter-chunk SubmitDelay window
+	// (Greptile P1). The UI may briefly show "running" for a prompt that then
+	// fails to deliver — preferable to a second prompt racing into the PTY
+	// mid-submit. Expect exactly one MarkPassthroughRunning call even when the
+	// subsequent write fails.
+	if got := len(agentManager.markPassthroughRunningCalls); got != 1 {
+		t.Errorf("MarkPassthroughRunning should be called once before the write; got %d call(s)", got)
 	}
 }
 
@@ -180,12 +188,84 @@ func TestExecutor_Prompt_PassthroughPreservesUnicodeAndMultiline(t *testing.T) {
 	if _, err := exec.Prompt(context.Background(), "task-1", "sess-1", prompt, nil, false); err != nil {
 		t.Fatalf("Prompt returned error: %v", err)
 	}
+	cfg := agents.PassthroughConfig{SubmitSequence: "\r"}
+	want := agents.BuildPassthroughPayload(prompt, cfg)
+	if len(agentManager.writePassthroughStdinCalls) != 1 {
+		t.Fatalf("expected 1 atomic WritePassthroughStdin call for multiline, got %d", len(agentManager.writePassthroughStdinCalls))
+	}
+	if agentManager.writePassthroughStdinCalls[0].Data != want {
+		t.Errorf("PTY payload = %q, want %q", agentManager.writePassthroughStdinCalls[0].Data, want)
+	}
+}
+
+// TestExecutor_Prompt_PassthroughHonoursDynamicSubmitSequence verifies the
+// PTY submit suffix is taken from PassthroughConfig (per-agent) rather than
+// hardcoded. A future TUI that submits on "\n" or "\x0d\x0a" plugs in via
+// PassthroughConfig.SubmitSequence with no code change here.
+func TestExecutor_Prompt_PassthroughHonoursDynamicSubmitSequence(t *testing.T) {
+	repo := newMockRepository()
+	agentManager := &mockAgentManager{
+		isPassthroughSessionFunc: func(_ context.Context, _ string) bool { return true },
+		resolvePassthroughConfigFunc: func(_ context.Context, _ string) (agents.PassthroughConfig, error) {
+			return agents.PassthroughConfig{Supported: true, SubmitSequence: "\n"}, nil
+		},
+	}
+	seedPassthroughSession(t, repo, agentManager, "task-1", "sess-1", "exec-1")
+	exec := newTestExecutor(t, agentManager, repo)
+
+	if _, err := exec.Prompt(context.Background(), "task-1", "sess-1", "hi", nil, false); err != nil {
+		t.Fatalf("Prompt returned error: %v", err)
+	}
 	if got := len(agentManager.writePassthroughStdinCalls); got != 1 {
 		t.Fatalf("expected 1 WritePassthroughStdin call, got %d", got)
 	}
-	want := prompt + "\r"
+	want := "hi\n"
 	if agentManager.writePassthroughStdinCalls[0].Data != want {
-		t.Errorf("PTY payload = %q, want %q", agentManager.writePassthroughStdinCalls[0].Data, want)
+		t.Errorf("PTY payload = %q, want %q (dynamic SubmitSequence not applied)", agentManager.writePassthroughStdinCalls[0].Data, want)
+	}
+}
+
+// TestExecutor_Prompt_PassthroughSubmitDelaySplitsWrites verifies the compose-box
+// follow-up path (Executor.Prompt → promptPassthrough) honors SubmitDelay: the
+// body and submit byte must arrive as two separate WritePassthroughStdin calls
+// with the body first and the submit ("\r") second, so Claude's Ink TUI sees the
+// trailing Enter as a discrete keystroke instead of absorbing it into a paste
+// burst. The auto-inject path is covered by manager_passthrough_autoinject_test.go;
+// this guards the executor path against regressing back to a single atomic write.
+func TestExecutor_Prompt_PassthroughSubmitDelaySplitsWrites(t *testing.T) {
+	repo := newMockRepository()
+	agentManager := &mockAgentManager{
+		isPassthroughSessionFunc: func(_ context.Context, _ string) bool { return true },
+		resolvePassthroughConfigFunc: func(_ context.Context, _ string) (agents.PassthroughConfig, error) {
+			return agents.PassthroughConfig{
+				Supported:             true,
+				SubmitSequence:        "\r",
+				DisableBracketedPaste: true,
+				SubmitDelay:           20 * time.Millisecond,
+			}, nil
+		},
+	}
+	seedPassthroughSession(t, repo, agentManager, "task-1", "sess-1", "exec-1")
+	exec := newTestExecutor(t, agentManager, repo)
+
+	if _, err := exec.Prompt(context.Background(), "task-1", "sess-1", "hello agent", nil, false); err != nil {
+		t.Fatalf("Prompt returned error: %v", err)
+	}
+
+	if got := len(agentManager.writePassthroughStdinCalls); got != 2 {
+		t.Fatalf("expected 2 WritePassthroughStdin calls (body, submit), got %d: %#v", got, agentManager.writePassthroughStdinCalls)
+	}
+	if agentManager.writePassthroughStdinCalls[0].Data != "hello agent" {
+		t.Errorf("body write Data = %q, want %q", agentManager.writePassthroughStdinCalls[0].Data, "hello agent")
+	}
+	if agentManager.writePassthroughStdinCalls[1].Data != "\r" {
+		t.Errorf("submit write Data = %q, want %q", agentManager.writePassthroughStdinCalls[1].Data, "\r")
+	}
+	// MarkPassthroughRunning must still fire exactly once after both writes — the
+	// session should flip to RUNNING for the UI even though the two writes were
+	// split. Regressing this would leave the spinner stuck on the composer.
+	if got := len(agentManager.markPassthroughRunningCalls); got != 1 {
+		t.Errorf("expected 1 MarkPassthroughRunning call, got %d", got)
 	}
 }
 
